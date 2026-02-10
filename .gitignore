@@ -1,0 +1,14 @@
+# build
+*.o
+fbpdf
+fbdjvu
+fbpdf2
+
+# backups
+*.bak*
+*.orig
+*.prebuttons*
+*.fixquotes*
+
+# temp
+*~

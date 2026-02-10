@@ -16,7 +16,15 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 #include <ctype.h>
+#include <errno.h>
+
 #include <signal.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <poll.h>
+#include <sys/time.h>
+#include <linux/input.h>
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -228,6 +236,115 @@ static int lmargin(void)
 	return ret;
 }
 
+
+/* ===== Button handling via evdev (Mi Pad 2) =====
+ * event9  -> gpio-keys (KEY_VOLUMEUP / KEY_VOLUMEDOWN)
+ * event10 -> gpio-keys (KEY_POWER)
+ *
+ * Vol+  -> Ctrl+F (next page)
+ * Vol-  -> Ctrl+B (prev page)
+ * Power long-press (>=700ms) -> q
+ * Power short press -> ignored
+ */
+static int evfd_vol = -1;
+static int evfd_pwr = -1;
+static int power_down = 0;
+static long long power_tdown_ms = 0;
+
+static long long now_ms(void)
+{
+	struct timeval tv;
+	gettimeofday(&tv, NULL);
+	return (long long)tv.tv_sec * 1000LL + (tv.tv_usec / 1000LL);
+}
+
+static void buttons_init(void)
+{
+	if (evfd_vol == -1)
+		evfd_vol = open("/dev/input/event9", O_RDONLY | O_NONBLOCK);
+	if (evfd_pwr == -1)
+		evfd_pwr = open("/dev/input/event10", O_RDONLY | O_NONBLOCK);
+}
+
+static int map_evdev_event(const struct input_event *ev)
+{
+	if (ev->type != EV_KEY)
+		return 0;
+	/* act only on press/release; ignore repeats */
+	if (ev->value != 1 && ev->value != 0)
+		return 0;
+
+	if (ev->code == KEY_VOLUMEUP && ev->value == 1)
+		return CTRLKEY('b');
+	if (ev->code == KEY_VOLUMEDOWN && ev->value == 1)
+		return CTRLKEY('f');
+
+	if (ev->code == KEY_POWER) {
+		if (ev->value == 1) {
+			power_down = 1;
+			power_tdown_ms = now_ms();
+		} else if (ev->value == 0 && power_down) {
+			long long dt = now_ms() - power_tdown_ms;
+			power_down = 0;
+			if (dt >= 700)
+				return 'q';
+			/* short press ignored */
+		}
+	}
+	return 0;
+}
+
+static int readkey_with_buttons(void)
+{
+	struct pollfd fds[3];
+	int nfds = 0;
+
+	buttons_init();
+
+	/* stdin (tty) */
+	fds[nfds].fd = 0;
+	fds[nfds].events = POLLIN;
+	nfds++;
+
+	if (evfd_vol != -1) {
+		fds[nfds].fd = evfd_vol;
+		fds[nfds].events = POLLIN;
+		nfds++;
+	}
+	if (evfd_pwr != -1) {
+		fds[nfds].fd = evfd_pwr;
+		fds[nfds].events = POLLIN;
+		nfds++;
+	}
+
+	for (;;) {
+		int r = poll(fds, nfds, -1);
+		if (r < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+
+		/* evdev first */
+		for (int i = 1; i < nfds; i++) {
+			if (fds[i].revents & POLLIN) {
+				struct input_event ev;
+				ssize_t n = read(fds[i].fd, &ev, sizeof(ev));
+				if (n == (ssize_t)sizeof(ev)) {
+					int c = map_evdev_event(&ev);
+					if (c)
+						return c;
+				}
+			}
+		}
+
+		/* then tty */
+		if (fds[0].revents & POLLIN)
+			return readkey();
+	}
+}
+
+
 static void mainloop(void)
 {
 	int step = srows / PAGESTEPS;
@@ -236,10 +353,11 @@ static void mainloop(void)
 	term_setup();
 	signal(SIGCONT, sigcont);
 	loadpage(num);
+	zoom_page(pcols ? zoom * scols / pcols : zoom); /* autofit width */
 	srow = prow;
 	scol = -scols / 2;
 	draw();
-	while ((c = readkey()) != -1) {
+	while ((c = readkey_with_buttons()) != -1) {
 		if (c == 'q')
 			break;
 		if (c == 'e' && reload())
@@ -363,6 +481,7 @@ static void mainloop(void)
 		case 'I':
 			invert = count || !invert ? 255 - (getcount(48) & 0xff) : 0;
 			loadpage(num);
+	zoom_page(pcols ? zoom * scols / pcols : zoom); /* autofit width */
 			break;
 		default:	/* no need to redraw */
 			continue;
