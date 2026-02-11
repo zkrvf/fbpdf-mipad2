@@ -24,6 +24,8 @@
 #include <poll.h>
 #include <sys/time.h>
 #include <linux/input.h>
+#include <sys/stat.h>
+
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -61,6 +63,60 @@ static int zoom_def = 150;	/* default zoom */
 static int rotate;
 static int count;
 static int invert;		/* invert colors? */
+
+
+/* ===== Resume state (per file) ===== */
+static unsigned long hash_path(const char *s)
+{
+	unsigned long h = 5381;
+	unsigned char c;
+	while ((c = (unsigned char)*s++))
+		h = ((h << 5) + h) + c;
+	return h;
+}
+
+static void ensure_state_dir(char *out, size_t outsz)
+{
+	const char *home = getenv("HOME");
+	char dir[256];
+	if (!home) home = "/tmp";
+	snprintf(dir, sizeof(dir), "%s/.local", home);
+	mkdir(dir, 0755);
+	snprintf(dir, sizeof(dir), "%s/.local/state", home);
+	mkdir(dir, 0755);
+	snprintf(dir, sizeof(dir), "%s/.local/state/fbpdf", home);
+	mkdir(dir, 0755);
+
+	unsigned long h = hash_path(filename);
+	snprintf(out, outsz, "%s/.local/state/fbpdf/%lx.state", home, h);
+}
+
+static void load_state(void)
+{
+	char path[320];
+	int p = 0;
+	FILE *fp;
+	ensure_state_dir(path, sizeof(path));
+	fp = fopen(path, "r");
+	if (!fp)
+		return;
+	if (fscanf(fp, "%d", &p) == 1 && p > 0)
+		num = p;
+	fclose(fp);
+}
+
+static void save_state(void)
+{
+	char path[320];
+	FILE *fp;
+	ensure_state_dir(path, sizeof(path));
+	fp = fopen(path, "w");
+	if (!fp)
+		return;
+	fprintf(fp, "%d\n", num);
+	fclose(fp);
+}
+
 
 static void draw(void)
 {
@@ -180,6 +236,10 @@ static int reload(void)
 {
 	doc_close(doc);
 	doc = doc_open(filename);
+	load_state();
+	if (num < 1) num = 1;
+	if (num > doc_pages(doc)) num = doc_pages(doc);
+
 	if (!doc || !doc_pages(doc)) {
 		fprintf(stderr, "\nfbpdf: cannot open <%s>\n", filename);
 		return 1;
@@ -358,10 +418,14 @@ static void mainloop(void)
 	scol = -scols / 2;
 	draw();
 	while ((c = readkey_with_buttons()) != -1) {
-		if (c == 'q')
-			break;
-		if (c == 'e' && reload())
-			break;
+                if (c == 'q') {
+                        save_state();
+                        break;
+                }
+                if (c == 'e' && reload()) {
+                        save_state();
+                        break;
+                }
 		switch (c) {	/* commands that do not require redrawing */
 		case 'o':
 			numdiff = num - getcount(num);
@@ -505,6 +569,10 @@ int main(int argc, char *argv[])
 	}
 	strcpy(filename, argv[argc - 1]);
 	doc = doc_open(filename);
+	load_state();
+	if (num < 1) num = 1;
+	if (num > doc_pages(doc)) num = doc_pages(doc);
+
 	if (!doc || !doc_pages(doc)) {
 		fprintf(stderr, "fbpdf: cannot open <%s>\n", filename);
 		return 1;
